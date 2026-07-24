@@ -6,7 +6,7 @@ A minimal, macOS-only command to switch between several Claude Code OAuth accoun
 
 ### Issue tracker
 
-Issues and specs live as GitHub issues in `saiday/claude-code-multi-login` (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
+Issues and specs live as GitHub issues in `saiday/claude-code-multi-account-switch` (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

@@ -1,6 +1,6 @@
 # Issue tracker: GitHub
 
-Issues and PRDs for this repo live as GitHub issues in `saiday/claude-code-multi-login`. Use the `gh` CLI for all operations.
+Issues and PRDs for this repo live as GitHub issues in `saiday/claude-code-multi-account-switch`. Use the `gh` CLI for all operations.
 
 ## Conventions
 
