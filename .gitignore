@@ -1,0 +1,6 @@
+claude-swap/
+
+# Never commit real Claude Code / MCP credential snapshots
+docs/credentials-*.json
+*credentials*.json
+.DS_Store

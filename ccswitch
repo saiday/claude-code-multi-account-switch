@@ -1,0 +1,921 @@
+#!/bin/bash
+#
+# ccswitch: save and switch between Claude Code OAuth accounts (macOS).
+#
+# This file is the whole tool: symlink it onto your PATH, no install step and
+# no runtime. It targets macOS's system bash (/bin/bash, GNU bash 3.2), so the
+# code stays inside the 3.2 feature set (no associative arrays, no mapfile).
+#
+# Storage model:
+#   - The live Claude Code credential lives in the macOS Keychain as a
+#     generic-password item (service "Claude Code-credentials", account
+#     $USER), whose value is JSON carrying `claudeAiOauth` and `mcpOAuth`.
+#   - Account identity metadata (`oauthAccount`: email, org, uuids) lives in
+#     the global Claude config file in $HOME.
+#   - Each saved account is a Keychain item (service "ccswitch", account
+#     "slot-N") whose value carries only `claudeAiOauth`.
+#   - A plaintext index at ~/.ccswitch/accounts.json (dir 0700, file 0600)
+#     holds no secrets: slot, email, alias, org uuid, org name, and the
+#     account's `oauthAccount` object verbatim. Identity is (email, org uuid).
+#
+# Every Keychain access goes through the three seam functions kc_read /
+# kc_write / kc_delete, which wrap the pinned /usr/bin/security. Tests redefine
+# those three with an in-memory/file-backed fake.
+
+# --- constants --------------------------------------------------------------
+
+# Pin security to its system path. The main reason is Keychain ACL stability:
+# creating and reading items with the same stable binary keeps the item ACL
+# bound, so no re-authorization prompt appears across tool upgrades. It also
+# stops an attacker-planted `security` earlier on PATH from intercepting a
+# credential. Other helpers (jq, tr, ...) resolve via PATH as usual; this pin is
+# specific to the Keychain binary.
+CC_SECURITY="/usr/bin/security"
+
+# The live Claude Code credential item (matches Claude Code's own item).
+CC_CRED_SERVICE="Claude Code-credentials"
+
+# ccswitch's own per-slot credential items.
+CCSWITCH_SERVICE="ccswitch"
+
+# `security -i` reads stdin with a 4096-byte fgets() buffer; a longer command
+# line is silently truncated mid-argument. Fall back to argv above this, with
+# 64 bytes of headroom for line-terminator accounting (Claude Code #30337).
+CCSWITCH_STDIN_LIMIT="${CCSWITCH_STDIN_LIMIT:-4032}"
+
+# rc 44 = errSecItemNotFound from find/delete-generic-password.
+CC_RC_NOT_FOUND=44
+
+# Bound every `security` spawn: a locked login Keychain on a headless/SSH host
+# can otherwise block forever waiting for an unlock prompt nobody can answer.
+# A healthy Keychain answers in well under 100ms.
+CCSWITCH_SECURITY_TIMEOUT="${CCSWITCH_SECURITY_TIMEOUT:-5}"
+
+# Set by kc_write to the path it took ("stdin" or "argv"); read by the contract
+# suite to assert the truncation-threshold fallback.
+CCSWITCH_LAST_WRITE_PATH=""
+
+# Claude Code guards its own token refresh and config writes with npm
+# proper-lockfile: a `mkdir`-based advisory *directory* at "<target>.lock",
+# considered stale once its mtime is older than ~10s. A switch holds both locks
+# for the whole (purely local) mutation so it can never collide with a
+# concurrent refresh and get silently reverted. We retry for ~9s (comfortably
+# outlasting one token round trip) before giving up. Both are env-overridable so
+# the test suite can force fast fresh-held failures and stale takeovers.
+CCSWITCH_LOCK_TIMEOUT="${CCSWITCH_LOCK_TIMEOUT:-9}"
+CCSWITCH_LOCK_STALENESS="${CCSWITCH_LOCK_STALENESS:-10}"
+
+# Space-separated list of lock directories this process currently holds, so the
+# EXIT/INT/TERM trap releases exactly what was acquired (see release_locks).
+_CCSWITCH_HELD_LOCKS=""
+
+# Populated by _security on each call.
+_SEC_OUT=""
+_SEC_ERR=""
+# One-shot: set to a file path to feed the next _security child's stdin (for
+# `security -i`); _security reads and clears it so it never leaks to a later call.
+_SEC_STDIN=""
+
+# --- small helpers ----------------------------------------------------------
+
+die() { printf 'ccswitch: %s\n' "$1" >&2; exit 1; }
+
+active_account_name() {
+  # Mirrors Claude Code's getUsername(): $USER first, then the OS username.
+  # Matching it matters on hosts where $USER is unset, so ccswitch keys the
+  # same Keychain item Claude Code does.
+  if [ -n "${USER:-}" ]; then
+    printf '%s' "$USER"
+  else
+    id -un
+  fi
+}
+
+_ccswitch_dir() { printf '%s' "$HOME/.ccswitch"; }
+_index_path() { printf '%s' "$HOME/.ccswitch/accounts.json"; }
+
+global_config_path() {
+  # Mirrors Claude Code's resolution: <config_home>/.config.json if it exists
+  # (legacy), else (CLAUDE_CONFIG_DIR || $HOME)/.claude.json.
+  local config_home="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  if [ -f "$config_home/.config.json" ]; then
+    printf '%s' "$config_home/.config.json"
+  elif [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    printf '%s' "$CLAUDE_CONFIG_DIR/.claude.json"
+  else
+    printf '%s' "$HOME/.claude.json"
+  fi
+}
+
+claude_config_home() {
+  # Claude Code's config home; the Keychain-less shadow credentials file and the
+  # credential-refresh lock both hang off it.
+  printf '%s' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+}
+
+shadow_credentials_path() {
+  # Claude Code's per-machine plaintext credential shadow. It may not exist;
+  # ccswitch only ever rewrites it, never creates it.
+  printf '%s' "$(claude_config_home)/.credentials.json"
+}
+
+credentials_lock_dir() {
+  # Claude Code's refresh lock: "<config_home>.lock" (e.g. ~/.claude.lock).
+  local home
+  home=$(claude_config_home)
+  printf '%s' "$(dirname "$home")/$(basename "$home").lock"
+}
+
+config_lock_dir() {
+  # Claude Code's global-config write lock: "<global_config>.lock".
+  printf '%s' "$(global_config_path).lock"
+}
+
+org_label() { # org_uuid org_name
+  if [ -n "$2" ]; then
+    printf '%s' "$2"
+  elif [ -n "$1" ]; then
+    printf '%s' "$1"
+  else
+    printf 'personal'
+  fi
+}
+
+# --- Keychain seam ----------------------------------------------------------
+#
+# kc_read / kc_write / kc_delete are the single seam through which all Keychain
+# access flows. Tests redefine exactly these three.
+
+_kc_quote() {
+  # Quote a value for a `security -i` stdin command line, which re-parses each
+  # line with a simple tokenizer (double quotes honoured, no $ or backtick
+  # expansion): wrap in double quotes and backslash-escape " and \. The only
+  # values quoted on this path are the constant service name and a "slot-<N>"
+  # account, so there is no untrusted input here; escaping " and \ suffices and
+  # matches Claude Code's own keychain wrapper.
+  local v="$1"
+  v=${v//\\/\\\\}
+  v=${v//\"/\\\"}
+  printf '"%s"' "$v"
+}
+
+_security() {
+  # Run `/usr/bin/security "$@"` bounded by a timeout, since macOS has no
+  # timeout(1). stdout/stderr are captured into _SEC_OUT/_SEC_ERR via temp
+  # files (not command substitution) so a backgrounded child can't wedge us.
+  #
+  # The child's stdin comes from _SEC_STDIN (a file) if set, else /dev/null.
+  # This explicit redirect is required: bash routes a backgrounded command's
+  # stdin from /dev/null when job control is off, so a `security -i` child
+  # would otherwise read nothing (and silently succeed, writing no item).
+  local outfile errfile pid killer rc stdin_src
+  stdin_src="${_SEC_STDIN:-/dev/null}"
+  [ -n "$stdin_src" ] || stdin_src="/dev/null"
+  _SEC_STDIN="" # one-shot: consume it so it can't leak into the next call
+  outfile=$(mktemp) || return 127
+  errfile=$(mktemp) || { rm -f "$outfile"; return 127; }
+
+  "$CC_SECURITY" "$@" <"$stdin_src" >"$outfile" 2>"$errfile" &
+  pid=$!
+
+  # Watchdog subshell: kill the security child if the timeout elapses. It holds
+  # its own `sleep` PID and traps TERM, so on the normal fast path (we cancel it
+  # the instant security returns) it reaps that sleep instead of leaving it
+  # orphaned for the full timeout, which is what killing a plain `( sleep; kill )`
+  # subshell would do.
+  (
+    sp=""
+    trap 'kill "$sp" 2>/dev/null; exit 0' TERM
+    sleep "$CCSWITCH_SECURITY_TIMEOUT" &
+    sp=$!
+    wait "$sp"
+    kill -TERM "$pid" 2>/dev/null
+  ) >/dev/null 2>&1 &
+  local watchdog=$!
+
+  wait "$pid"
+  rc=$?
+  kill -TERM "$watchdog" 2>/dev/null
+  wait "$watchdog" 2>/dev/null
+
+  _SEC_OUT=$(cat "$outfile")
+  _SEC_ERR=$(cat "$errfile")
+  rm -f "$outfile" "$errfile"
+  return "$rc"
+}
+
+kc_read() {
+  # Echo the stored value on stdout and return 0; return 44 for a clean miss;
+  # return the raw rc on a real error, retried once first.
+  local service="$1" account="$2" attempt rc
+  rc=0
+  for attempt in 1 2; do
+    _security find-generic-password -a "$account" -w -s "$service"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      printf '%s' "$_SEC_OUT"
+      return 0
+    fi
+    if [ "$rc" -eq "$CC_RC_NOT_FOUND" ]; then
+      return "$CC_RC_NOT_FOUND"
+    fi
+    # A real error (locked / denied / timeout): retry once, then give up.
+  done
+  return "$rc"
+}
+
+kc_write() {
+  # Create or update a generic-password item (-U). Prefer stdin so the secret
+  # stays out of argv; fall back to argv only when the stdin command line would
+  # overflow security -i's line buffer and be silently truncated.
+  local service="$1" account="$2" value="$3" hex cmdline rc
+  hex=$(printf '%s' "$value" | /usr/bin/xxd -p | tr -d '\n')
+  cmdline="add-generic-password -U -a $(_kc_quote "$account") -s $(_kc_quote "$service") -X ${hex}"
+
+  # +1 for the trailing newline fed to security -i; mirrors passing "cmdline\n".
+  if [ "$((${#cmdline} + 1))" -le "$CCSWITCH_STDIN_LIMIT" ]; then
+    CCSWITCH_LAST_WRITE_PATH="stdin"
+    local sf
+    sf=$(mktemp) || { printf 'ccswitch: cannot create temp file for keychain write\n' >&2; return 1; }
+    printf '%s\n' "$cmdline" >"$sf"
+    _SEC_STDIN="$sf"
+    _security -i
+    rc=$?
+    rm -f "$sf"
+  else
+    CCSWITCH_LAST_WRITE_PATH="argv"
+    _security add-generic-password -U -a "$account" -s "$service" -X "$hex"
+    rc=$?
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    printf 'ccswitch: keychain write failed (rc=%s): %s\n' "$rc" "$_SEC_ERR" >&2
+    return 1
+  fi
+  return 0
+}
+
+kc_delete() {
+  # Delete an item; both success and "already absent" (rc 44) count as success.
+  local service="$1" account="$2" rc
+  _security delete-generic-password -a "$account" -s "$service"
+  rc=$?
+  if [ "$rc" -eq 0 ] || [ "$rc" -eq "$CC_RC_NOT_FOUND" ]; then
+    return 0
+  fi
+  printf 'ccswitch: keychain delete failed (rc=%s): %s\n' "$rc" "$_SEC_ERR" >&2
+  return 1
+}
+
+# --- index I/O --------------------------------------------------------------
+
+read_index() {
+  local f
+  f=$(_index_path)
+  if [ -f "$f" ]; then
+    cat "$f"
+  else
+    printf '%s' '{"version":1,"accounts":[]}'
+  fi
+}
+
+index_field() {
+  # Print one field of the index record matching identity (email, org uuid), or
+  # empty if there is no match. $1 index JSON, $2 email, $3 org uuid, $4 field.
+  printf '%s' "$1" | jq -r --arg e "$2" --arg o "$3" --arg f "$4" \
+    '(.accounts[] | select(.email==$e and .organizationUuid==$o) | .[$f]) // empty' \
+    | head -1
+}
+
+write_index() {
+  # Atomic temp-file-and-rename inside the 0700 index dir; file left mode 0600.
+  local content="$1" dir f tmp
+  dir=$(_ccswitch_dir)
+  if [ ! -d "$dir" ]; then
+    mkdir -p "$dir" || die "cannot create $dir"
+  fi
+  chmod 700 "$dir"
+  f=$(_index_path)
+  tmp=$(mktemp "$dir/.accounts.XXXXXX") || die "cannot create temp index file"
+  printf '%s\n' "$content" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$f"
+}
+
+# --- advisory locks ---------------------------------------------------------
+#
+# proper-lockfile-compatible directory locks, cooperating with Claude Code's
+# own refresh/config locks. Acquire by mkdir (its atomicity is the mutex);
+# break a lock whose mtime is older than the staleness window; retry up to the
+# timeout; release via the caller's EXIT/INT/TERM trap. No liveness toucher: the
+# whole switch is sub-second local I/O, far inside the staleness window.
+
+acquire_lock() {
+  # Acquire the lock directory $1. Return 0 on success (recording it for
+  # release), 1 if it stays held past the timeout.
+  local dir="$1" start now held_mtime
+  start=$(date +%s)
+  while true; do
+    if mkdir "$dir" 2>/dev/null; then
+      _CCSWITCH_HELD_LOCKS="$_CCSWITCH_HELD_LOCKS $dir"
+      return 0
+    fi
+    now=$(date +%s)
+    # Held by someone else: break it only if provably stale (mtime older than
+    # the staleness window). Losing the rmdir/mkdir race to another waiter just
+    # loops again.
+    held_mtime=$(stat -f '%m' "$dir" 2>/dev/null)
+    if [ -n "$held_mtime" ] && [ "$((now - held_mtime))" -gt "$CCSWITCH_LOCK_STALENESS" ]; then
+      rmdir "$dir" 2>/dev/null
+      continue
+    fi
+    if [ "$((now - start))" -ge "$CCSWITCH_LOCK_TIMEOUT" ]; then
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
+release_locks() {
+  # Release every lock this process holds. Called from the switch's trap, so it
+  # runs on normal exit, on `die`, and on interrupt.
+  local d
+  for d in $_CCSWITCH_HELD_LOCKS; do
+    rmdir "$d" 2>/dev/null
+  done
+  _CCSWITCH_HELD_LOCKS=""
+}
+
+# --- atomic file writes -----------------------------------------------------
+
+write_config_oauth_account() {
+  # Rewrite the global config at $1, replacing only .oauthAccount with $2 and
+  # preserving every other key (projects, feature flags, the telemetry id), via
+  # temp-file-and-rename that keeps the file's existing mode. Return non-zero on
+  # any failure without leaving a partial file.
+  local path="$1" oa="$2" dir existing mode tmp
+  dir=$(dirname "$path")
+  if [ -f "$path" ]; then
+    existing=$(cat "$path")
+    mode=$(stat -f '%Lp' "$path" 2>/dev/null || printf '600')
+  else
+    existing='{}'
+    mode=600
+  fi
+  tmp=$(mktemp "$dir/.claude.json.XXXXXX") || return 1
+  if ! printf '%s' "$existing" | jq --argjson oa "$oa" '.oauthAccount = $oa' >"$tmp" 2>/dev/null; then
+    rm -f "$tmp"; return 1
+  fi
+  chmod "$mode" "$tmp" 2>/dev/null || true
+  mv "$tmp" "$path" || { rm -f "$tmp"; return 1; }
+}
+
+write_shadow() {
+  # Rewrite the shadow credentials file at $1 with value $2 via temp-file,
+  # chmod 0600, and rename (the rename bumps its mtime for Claude Code's
+  # ~30s hot-reload). Return non-zero on any failure.
+  local path="$1" value="$2" dir tmp
+  dir=$(dirname "$path")
+  tmp=$(mktemp "$dir/.credentials.XXXXXX") || return 1
+  printf '%s' "$value" >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$path" || { rm -f "$tmp"; return 1; }
+}
+
+# --- live account -----------------------------------------------------------
+
+live_oauth_account() {
+  # Print the live `oauthAccount` JSON and return 0, or return 1 if absent.
+  local cfg oa
+  cfg=$(global_config_path)
+  [ -f "$cfg" ] || return 1
+  oa=$(jq -ec '.oauthAccount // empty' "$cfg" 2>/dev/null) || return 1
+  [ -n "$oa" ] || return 1
+  printf '%s' "$oa"
+}
+
+lowest_free_slot() {
+  local idx="$1" used n
+  used=$(printf '%s' "$idx" | jq -r '.accounts[].slot' | sort -n)
+  n=1
+  while printf '%s\n' "$used" | grep -qx "$n"; do
+    n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
+
+live_active_slot() {
+  # Print the slot number of the currently-active account, or empty if there's
+  # no live login or the live account isn't saved. "Active" is derived from the
+  # live login (matching the oauthAccount identity against the index $1), never
+  # a stored pointer that could drift, so switch/remove share this one place.
+  local idx="$1" oa email org
+  oa=$(live_oauth_account) || return 0
+  email=$(printf '%s' "$oa" | jq -r '.emailAddress // ""')
+  org=$(printf '%s' "$oa" | jq -r '.organizationUuid // ""')
+  index_field "$idx" "$email" "$org" slot
+}
+
+# --- selectors and aliases --------------------------------------------------
+
+normalize_alias() {
+  # Trim, lowercase, and validate a proposed alias. On success print the
+  # normalized form and return 0; on failure print the reason to stderr and
+  # return 1 (callers do `x=$(normalize_alias "$raw") || return 1`). The rules
+  # keep aliases usable as selectors: never purely numeric (a bare integer is
+  # always read as a slot number), never leading with '-' (would parse as a
+  # flag), and confined to a safe charset so it survives the TSV `list` output.
+  local raw="$1" a
+  a=$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')
+  if [ -z "$a" ]; then
+    printf 'ccswitch: alias cannot be empty\n' >&2
+    return 1
+  fi
+  if printf '%s' "$a" | grep -qE '^[0-9]+$'; then
+    printf "ccswitch: alias '%s' cannot be purely numeric (reserved for slot numbers)\n" "$raw" >&2
+    return 1
+  fi
+  case "$a" in
+    -*) printf "ccswitch: alias '%s' cannot start with '-' (would be read as a command flag)\n" "$raw" >&2; return 1 ;;
+  esac
+  if ! printf '%s' "$a" | grep -qE '^[a-z0-9_.-]+$'; then
+    printf "ccswitch: alias '%s' may only contain letters, digits, '-', '_', and '.'\n" "$raw" >&2
+    return 1
+  fi
+  printf '%s' "$a"
+}
+
+alias_owner_slot() {
+  # Print the slot number whose (normalized) alias equals $2, or empty if none.
+  # $2 is expected already normalized (lowercase). $1 is the index JSON.
+  printf '%s' "$1" | jq -r --arg a "$2" \
+    'first(.accounts[] | select($a != "" and (.alias // "" | ascii_downcase) == $a) | .slot) // empty'
+}
+
+resolve_selector() {
+  # Resolve a <N|email|alias> selector to a slot number. On success print the
+  # slot to stdout and return 0; on failure print a clear reason to stderr and
+  # return 1 without touching anything. Precedence: a bare positive integer is
+  # a slot number; otherwise an alias (case-insensitive); otherwise an email.
+  # An email that matches more than one slot is ambiguous and lists the
+  # candidates rather than guessing. This is the shared front door for the
+  # alias command (and the coming switch/remove commands).
+  local idx="$1" sel="$2" hit by_alias slots n
+  if printf '%s' "$sel" | grep -qE '^[1-9][0-9]*$'; then
+    hit=$(printf '%s' "$idx" | jq -r --argjson s "$sel" '[.accounts[] | select(.slot==$s)] | length')
+    if [ "$hit" -gt 0 ]; then
+      printf '%s' "$sel"
+      return 0
+    fi
+    printf 'ccswitch: no saved account in slot %s. Run: ccswitch list\n' "$sel" >&2
+    return 1
+  fi
+
+  # Alias match is case-insensitive; stored aliases are already normalized to
+  # lowercase, so lowercase the selector and reuse the one alias lookup.
+  by_alias=$(alias_owner_slot "$idx" "$(printf '%s' "$sel" | tr '[:upper:]' '[:lower:]')")
+  if [ -n "$by_alias" ]; then
+    printf '%s' "$by_alias"
+    return 0
+  fi
+
+  slots=$(printf '%s' "$idx" | jq -r --arg e "$sel" '.accounts[] | select(.email==$e) | .slot')
+  n=$(printf '%s\n' "$slots" | awk 'NF{c++} END{print c+0}')
+  if [ "$n" -eq 1 ]; then
+    printf '%s' "$slots"
+    return 0
+  fi
+  if [ "$n" -gt 1 ]; then
+    {
+      printf "ccswitch: '%s' matches more than one slot:\n" "$sel"
+      printf '%s' "$idx" | jq -r --arg e "$sel" \
+        '.accounts[] | select(.email==$e)
+         | "  slot \(.slot)  \(.email)  ("
+           + (if (.organizationName // "") != "" then .organizationName
+              elif (.organizationUuid // "") != "" then .organizationUuid
+              else "personal" end)
+           + ")"'
+      printf 'Re-run with the slot number or an alias.\n'
+    } >&2
+    return 1
+  fi
+
+  printf "ccswitch: unknown account: '%s'. It matches no slot number, alias, or email. Nothing changed.\n" "$sel" >&2
+  return 1
+}
+
+# --- commands ---------------------------------------------------------------
+
+cmd_add() {
+  local want_slot="" want_alias="" have_alias=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --slot) want_slot="${2:-}"; shift 2 || die "--slot requires a number" ;;
+      --slot=*) want_slot="${1#--slot=}"; shift ;;
+      --alias) want_alias="${2:-}"; have_alias=1; shift 2 || die "--alias requires a name" ;;
+      --alias=*) want_alias="${1#--alias=}"; have_alias=1; shift ;;
+      -h | --help) cmd_help; return 0 ;;
+      *) die "add: unexpected argument: $1" ;;
+    esac
+  done
+  if [ -n "$want_slot" ] && ! printf '%s' "$want_slot" | grep -qE '^[1-9][0-9]*$'; then
+    die "--slot must be a positive integer"
+  fi
+  # Validate the alias up front so an invalid one changes nothing.
+  if [ "$have_alias" -eq 1 ]; then
+    want_alias=$(normalize_alias "$want_alias") || return 1
+  fi
+
+  # Live credential.
+  local live_cred rc
+  live_cred=$(kc_read "$CC_CRED_SERVICE" "$(active_account_name)")
+  rc=$?
+  if [ "$rc" -eq "$CC_RC_NOT_FOUND" ]; then
+    die "no active Claude Code credential in the Keychain. Log in first (run Claude Code and use /login), then: ccswitch add"
+  fi
+  if [ "$rc" -ne 0 ]; then
+    die "could not read the Keychain (rc=$rc). Is the login Keychain unlocked?"
+  fi
+  local claude_oauth
+  claude_oauth=$(printf '%s' "$live_cred" | jq -ec '.claudeAiOauth // empty' 2>/dev/null)
+  if [ -z "$claude_oauth" ]; then
+    die "the active credential has no claudeAiOauth. Log in first, then: ccswitch add"
+  fi
+
+  # Live identity.
+  local oauth_account
+  oauth_account=$(live_oauth_account) || die "no oauthAccount in the Claude config ($(global_config_path)). Log in first, then: ccswitch add"
+  local email org_uuid org_name
+  email=$(printf '%s' "$oauth_account" | jq -r '.emailAddress // ""')
+  org_uuid=$(printf '%s' "$oauth_account" | jq -r '.organizationUuid // ""')
+  org_name=$(printf '%s' "$oauth_account" | jq -r '.organizationName // ""')
+  [ -n "$email" ] || die "the active account has no email address; cannot save it"
+
+  local index existing_slot existing_alias slot
+  index=$(read_index)
+  existing_slot=$(index_field "$index" "$email" "$org_uuid" slot)
+  existing_alias=$(index_field "$index" "$email" "$org_uuid" alias)
+
+  if [ -n "$existing_slot" ]; then
+    # (email, org) already saved → refresh in place, keeping its slot number.
+    slot="$existing_slot"
+  elif [ -n "$want_slot" ]; then
+    local occupied
+    occupied=$(printf '%s' "$index" | jq -r --argjson s "$want_slot" \
+      '(.accounts[] | select(.slot==$s) | .email) // empty' | head -1)
+    if [ -n "$occupied" ]; then
+      die "slot $want_slot is already used by $occupied. Omit --slot to auto-assign, or pick a free number."
+    fi
+    slot="$want_slot"
+  else
+    slot=$(lowest_free_slot "$index")
+  fi
+
+  # Decide the alias: --alias overrides; otherwise keep whatever this account
+  # already had. Refuse an alias already worn by a different slot so it stays a
+  # unique selector. Checked before any write, so a clash changes nothing.
+  local final_alias="$existing_alias"
+  if [ "$have_alias" -eq 1 ]; then
+    local owner
+    owner=$(alias_owner_slot "$index" "$want_alias")
+    if [ -n "$owner" ] && [ "$owner" != "$slot" ]; then
+      die "alias '$want_alias' is already used by slot $owner. Pick another name or rename that slot first."
+    fi
+    final_alias="$want_alias"
+  fi
+
+  # Write the slot's Keychain item (value carries only claudeAiOauth), then
+  # the index. The Keychain is the source of truth, so it lands first.
+  local slot_value
+  slot_value=$(printf '%s' "$claude_oauth" | jq -c '{claudeAiOauth: .}')
+  kc_write "$CCSWITCH_SERVICE" "slot-$slot" "$slot_value" || die "could not write the credential to the Keychain"
+
+  local record new_index
+  record=$(jq -nc \
+    --argjson slot "$slot" \
+    --arg email "$email" \
+    --arg alias "$final_alias" \
+    --arg org "$org_uuid" \
+    --arg orgn "$org_name" \
+    --argjson oa "$oauth_account" \
+    '{slot:$slot, email:$email, alias:(if $alias=="" then null else $alias end), organizationUuid:$org, organizationName:$orgn, oauthAccount:$oa}')
+  new_index=$(printf '%s' "$index" | jq --argjson rec "$record" \
+    '.version = (.version // 1)
+     | .accounts = ((.accounts | map(select(.email != $rec.email or .organizationUuid != $rec.organizationUuid))) + [$rec] | sort_by(.slot))')
+  write_index "$new_index"
+
+  printf 'Saved %s (%s) to slot %s.\n' "$email" "$(org_label "$org_uuid" "$org_name")" "$slot"
+}
+
+cmd_list() {
+  local index count
+  index=$(read_index)
+  count=$(printf '%s' "$index" | jq '.accounts | length')
+  if [ "$count" -eq 0 ]; then
+    printf 'No saved accounts yet. Log in with Claude Code, then run: ccswitch add\n'
+    return 0
+  fi
+
+  local live_email="" live_org="" oa
+  if oa=$(live_oauth_account); then
+    live_email=$(printf '%s' "$oa" | jq -r '.emailAddress // ""')
+    live_org=$(printf '%s' "$oa" | jq -r '.organizationUuid // ""')
+  fi
+
+  printf '%-4s %-6s %-30s %-22s %s\n' "SLOT" "ACTIVE" "EMAIL" "ORG" "ALIAS"
+  printf '%s' "$index" | jq -r '.accounts | sort_by(.slot)[] | [(.slot|tostring), .email, (.organizationName // ""), (.organizationUuid // ""), (.alias // "")] | @tsv' \
+    | while IFS=$'\t' read -r slot email orgn orgu alias; do
+        local marker=" " org
+        if [ -n "$live_email" ] && [ "$email" = "$live_email" ] && [ "$orgu" = "$live_org" ]; then
+          marker="*"
+        fi
+        org=$(org_label "$orgu" "$orgn")
+        printf '%-4s %-6s %-30s %-22s %s\n' "$slot" "$marker" "$email" "$org" "$alias"
+      done
+}
+
+cmd_status() {
+  local oa
+  if ! oa=$(live_oauth_account); then
+    printf 'Not logged in to Claude Code (no active oauthAccount found).\n'
+    return 0
+  fi
+  local email org_uuid org_name index slot alias
+  email=$(printf '%s' "$oa" | jq -r '.emailAddress // ""')
+  org_uuid=$(printf '%s' "$oa" | jq -r '.organizationUuid // ""')
+  org_name=$(printf '%s' "$oa" | jq -r '.organizationName // ""')
+  index=$(read_index)
+  slot=$(index_field "$index" "$email" "$org_uuid" slot)
+
+  if [ -n "$slot" ]; then
+    alias=$(index_field "$index" "$email" "$org_uuid" alias)
+    if [ -n "$alias" ]; then
+      printf 'Active: slot %s  %s  (%s)  alias=%s\n' "$slot" "$email" "$(org_label "$org_uuid" "$org_name")" "$alias"
+    else
+      printf 'Active: slot %s  %s  (%s)\n' "$slot" "$email" "$(org_label "$org_uuid" "$org_name")"
+    fi
+  else
+    printf 'Active: %s  (%s)  [not saved; run: ccswitch add]\n' "$email" "$(org_label "$org_uuid" "$org_name")"
+  fi
+}
+
+cmd_alias() {
+  # ccswitch alias <N|email|alias> <name>: set or replace a slot's alias.
+  case "${1:-}" in
+    -h | --help) cmd_help; return 0 ;;
+  esac
+  [ $# -eq 2 ] || die "usage: ccswitch alias <N|email|alias> <name>"
+  local sel="$1" raw="$2" norm index slot owner email new_index
+  # Validate the new name before resolving, so nothing changes on a bad name.
+  norm=$(normalize_alias "$raw") || return 1
+  index=$(read_index)
+  slot=$(resolve_selector "$index" "$sel") || return 1
+  owner=$(alias_owner_slot "$index" "$norm")
+  if [ -n "$owner" ] && [ "$owner" != "$slot" ]; then
+    die "alias '$norm' is already used by slot $owner. Pick another name."
+  fi
+  new_index=$(printf '%s' "$index" | jq --argjson s "$slot" --arg a "$norm" \
+    '.accounts = (.accounts | map(if .slot == $s then (.alias = $a) else . end))')
+  write_index "$new_index"
+  email=$(printf '%s' "$index" | jq -r --argjson s "$slot" \
+    'first(.accounts[] | select(.slot == $s) | .email) // empty')
+  printf 'Slot %s (%s) alias set to %s.\n' "$slot" "$email" "$norm"
+}
+
+_switch_rollback() {
+  # Restore every store the in-progress switch has touched, from the snapshots
+  # captured under the locks. Best-effort: each restore is attempted
+  # independently so one failure never blocks the others. Relies on dynamic
+  # scope for the snapshot locals set in cmd_switch.
+  if [ "$had_live" -eq 1 ]; then
+    kc_write "$CC_CRED_SERVICE" "$cred_account" "$live_cred" 2>/dev/null || true
+  else
+    kc_delete "$CC_CRED_SERVICE" "$cred_account" 2>/dev/null || true
+  fi
+  if [ "$cfg_existed" -eq 1 ]; then
+    printf '%s' "$cfg_snapshot" >"$cfg" 2>/dev/null || true
+  fi
+  if [ "$shadow_existed" -eq 1 ]; then
+    printf '%s' "$shadow_snapshot" >"$shadow" 2>/dev/null || true
+  fi
+}
+
+cmd_switch() {
+  # ccswitch switch <N|email|alias>: make a saved account the live login,
+  # network-free, coordinating with Claude Code's own locks and rolling back
+  # on any failure.
+  case "${1:-}" in
+    -h | --help) cmd_help; return 0 ;;
+  esac
+  [ $# -eq 1 ] || die "usage: ccswitch switch <N|email|alias>"
+
+  local index target_slot
+  index=$(read_index)
+  target_slot=$(resolve_selector "$index" "$1") || return 1
+
+  # The target's stored identity (oauthAccount) and credential (claudeAiOauth).
+  local target_oa target_email target_org target_orgn
+  target_oa=$(printf '%s' "$index" | jq -ec --argjson s "$target_slot" \
+    'first(.accounts[] | select(.slot==$s) | .oauthAccount) // empty')
+  [ -n "$target_oa" ] || die "slot $target_slot has no stored oauthAccount; re-add it with: ccswitch add"
+  target_email=$(printf '%s' "$target_oa" | jq -r '.emailAddress // ""')
+  target_org=$(printf '%s' "$target_oa" | jq -r '.organizationUuid // ""')
+  target_orgn=$(printf '%s' "$target_oa" | jq -r '.organizationName // ""')
+
+  local target_slot_value target_claude_oauth rc
+  target_slot_value=$(kc_read "$CCSWITCH_SERVICE" "slot-$target_slot")
+  rc=$?
+  [ "$rc" -eq 0 ] || die "slot $target_slot has no stored credential in the Keychain; re-add it with: ccswitch add"
+  target_claude_oauth=$(printf '%s' "$target_slot_value" | jq -ec '.claudeAiOauth // empty')
+  [ -n "$target_claude_oauth" ] || die "slot $target_slot credential is missing claudeAiOauth; re-add it with: ccswitch add"
+
+  # The active slot (from the live login): used to detect an already-active
+  # no-op and to find the outgoing slot for re-capture.
+  local active_slot
+  active_slot=$(live_active_slot "$index")
+
+  if [ -n "$active_slot" ] && [ "$active_slot" = "$target_slot" ]; then
+    printf 'Already active: slot %s  %s  (%s). Nothing to do.\n' \
+      "$target_slot" "$target_email" "$(org_label "$target_org" "$target_orgn")"
+    return 0
+  fi
+
+  local cred_account
+  cred_account=$(active_account_name)
+
+  local cfg shadow
+  cfg=$(global_config_path)
+  shadow=$(shadow_credentials_path)
+
+  # Hold both of Claude Code's advisory locks for the whole mutation (all local
+  # I/O, no network). Everything from the snapshot through the writes happens
+  # under the locks so a concurrent Claude Code refresh cannot slip between the
+  # snapshot and the writes. The EXIT trap releases the locks on normal return
+  # and on die; the INT/TERM trap releases them and then exits, so a Ctrl-C
+  # aborts the mutation rather than resuming it lock-free.
+  trap 'release_locks' EXIT
+  trap 'release_locks; exit 130' INT TERM
+  acquire_lock "$(credentials_lock_dir)" \
+    || die "could not acquire Claude Code's credential lock; it may be refreshing its token. Retry in a few seconds."
+  acquire_lock "$(config_lock_dir)" \
+    || die "could not acquire Claude Code's config lock. Retry in a few seconds."
+
+  # Snapshot every store about to be touched, under the locks. The live Keychain
+  # item is both the base we splice into (so mcpOAuth and any siblings survive)
+  # and the snapshot we roll back to.
+  local live_cred had_live=0 cfg_existed cfg_snapshot shadow_existed shadow_snapshot
+  live_cred=$(kc_read "$CC_CRED_SERVICE" "$cred_account")
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    had_live=1
+  elif [ "$rc" -eq "$CC_RC_NOT_FOUND" ]; then
+    had_live=0; live_cred=""
+  else
+    die "could not read the Keychain (rc=$rc). Is the login Keychain unlocked?"
+  fi
+  if [ -f "$cfg" ]; then cfg_existed=1; cfg_snapshot=$(cat "$cfg"); else cfg_existed=0; cfg_snapshot=""; fi
+  if [ -f "$shadow" ]; then shadow_existed=1; shadow_snapshot=$(cat "$shadow"); else shadow_existed=0; shadow_snapshot=""; fi
+
+  # Network-free re-capture of the outgoing account, before mutating the live
+  # stores: if the live identity maps to a saved slot, re-save the live
+  # claudeAiOauth there so a rotated refresh token is captured and the slot
+  # cannot go stale. Skipped when the live login matches no slot, so a foreign
+  # login can never poison a slot (the poison guard).
+  if [ -n "$active_slot" ] && [ "$had_live" -eq 1 ]; then
+    local out_claude out_value
+    out_claude=$(printf '%s' "$live_cred" | jq -ec '.claudeAiOauth // empty')
+    if [ -n "$out_claude" ]; then
+      out_value=$(printf '%s' "$out_claude" | jq -c '{claudeAiOauth: .}')
+      kc_write "$CCSWITCH_SERVICE" "slot-$active_slot" "$out_value" \
+        || die "could not re-capture the outgoing account into slot $active_slot"
+    fi
+  fi
+
+  # The new live credential: preserve everything already in the live item and
+  # replace only claudeAiOauth. The same value goes to the Keychain and, if
+  # present, the shadow file.
+  local base new_value
+  if [ "$had_live" -eq 1 ]; then base="$live_cred"; else base='{}'; fi
+  new_value=$(printf '%s' "$base" | jq -c --argjson c "$target_claude_oauth" '.claudeAiOauth = $c')
+
+  # 1. Active Keychain item: replace only claudeAiOauth, preserving mcpOAuth.
+  kc_write "$CC_CRED_SERVICE" "$cred_account" "$new_value" \
+    || { _switch_rollback; die "keychain write failed during switch; rolled back. Nothing changed."; }
+
+  # 2. Global config: replace only oauthAccount, preserving every other key.
+  write_config_oauth_account "$cfg" "$target_oa" \
+    || { _switch_rollback; die "config write failed during switch; rolled back. Nothing changed."; }
+
+  # 3. Shadow credentials file: only if it already exists.
+  if [ "$shadow_existed" -eq 1 ]; then
+    write_shadow "$shadow" "$new_value" \
+      || { _switch_rollback; die "credentials-file write failed during switch; rolled back. Nothing changed."; }
+  fi
+
+  release_locks
+  trap - EXIT INT TERM
+
+  printf 'Switched to slot %s  %s  (%s).\n' "$target_slot" "$target_email" "$(org_label "$target_org" "$target_orgn")"
+  printf 'A running Claude Code session picks this up within ~30s, or immediately on restart.\n'
+}
+
+cmd_remove() {
+  # ccswitch remove <N|email|alias> [--force]: drop a saved account, deleting
+  # its Keychain item and its index entry. Refuses the currently-active slot
+  # unless --force, so the user can't accidentally strand themselves logged in
+  # with no saved copy of that account. Never renumbers survivors; the freed
+  # slot number is simply reused by the next `add` (lowest_free_slot).
+  local force=0 sel=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f | --force) force=1; shift ;;
+      -h | --help) cmd_help; return 0 ;;
+      -*) die "remove: unexpected option: $1" ;;
+      *)
+        [ -z "$sel" ] || die "usage: ccswitch remove <N|email|alias> [--force]"
+        sel="$1"; shift ;;
+    esac
+  done
+  [ -n "$sel" ] || die "usage: ccswitch remove <N|email|alias> [--force]"
+
+  local index slot
+  index=$(read_index)
+  slot=$(resolve_selector "$index" "$sel") || return 1
+
+  # The guard tracks reality (the live login), not a stored pointer that could
+  # drift, so it refuses only when the target really is the active account.
+  local active_slot
+  active_slot=$(live_active_slot "$index")
+  if [ -n "$active_slot" ] && [ "$active_slot" = "$slot" ] && [ "$force" -ne 1 ]; then
+    die "slot $slot is the active account; removing it would leave you logged in with no saved copy. Re-run with --force to remove it anyway."
+  fi
+
+  # Capture the email for the confirmation before we drop the record.
+  local email
+  email=$(printf '%s' "$index" | jq -r --argjson s "$slot" \
+    'first(.accounts[] | select(.slot == $s) | .email) // empty')
+
+  # Keychain item first (the source of truth), then the index entry.
+  kc_delete "$CCSWITCH_SERVICE" "slot-$slot" || die "could not delete slot $slot's Keychain item"
+  local new_index
+  new_index=$(printf '%s' "$index" | jq --argjson s "$slot" \
+    '.accounts = (.accounts | map(select(.slot != $s)))')
+  write_index "$new_index"
+
+  printf 'Removed slot %s (%s).\n' "$slot" "$email"
+}
+
+cmd_help() {
+  cat <<'EOF'
+ccswitch: save and switch between Claude Code OAuth accounts (macOS)
+
+Usage:
+  ccswitch add [--slot N] [--alias NAME]
+                            Save the currently logged-in account into a slot.
+                            Re-adding the same account refreshes it in place.
+  ccswitch switch <N|email|alias>
+                            Make a saved account the live Claude Code login,
+                            with no browser re-auth.
+  ccswitch alias <N|email|alias> <name>
+                            Set or replace a saved account's alias.
+  ccswitch remove <N|email|alias> [--force]
+                            Drop a saved account. Removing the currently-active
+                            account is refused unless --force is given.
+  ccswitch list             List saved accounts; * marks the live one.
+  ccswitch status           Show the currently active account.
+  ccswitch help             Show this help.
+
+Selectors: refer to a saved account by slot number, alias, or email. An email
+shared by two orgs is ambiguous; use the slot number or an alias instead.
+
+Setup: log in with Claude Code, then run `ccswitch add`. Repeat for each
+account you want to keep ready.
+EOF
+}
+
+# --- dispatch ---------------------------------------------------------------
+
+main() {
+  set -u
+  local cmd="${1:-help}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    add) cmd_add "$@" ;;
+    switch) cmd_switch "$@" ;;
+    alias) cmd_alias "$@" ;;
+    remove) cmd_remove "$@" ;;
+    list) cmd_list "$@" ;;
+    status) cmd_status "$@" ;;
+    help | -h | --help) cmd_help ;;
+    *)
+      printf 'ccswitch: unknown command: %s\n\n' "$cmd" >&2
+      cmd_help >&2
+      return 2
+      ;;
+  esac
+}
+
+# Run only when executed, not when sourced (tests source this file).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
