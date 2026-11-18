@@ -55,6 +55,11 @@ CCSWITCH_SECURITY_TIMEOUT="${CCSWITCH_SECURITY_TIMEOUT:-5}"
 # suite to assert the truncation-threshold fallback.
 CCSWITCH_LAST_WRITE_PATH=""
 
+# The OAuth profile endpoint resolves an access token to its account; bounded
+# like every other external call.
+CCSWITCH_PROFILE_URL="https://api.anthropic.com/api/oauth/profile"
+CCSWITCH_PROFILE_TIMEOUT="${CCSWITCH_PROFILE_TIMEOUT:-5}"
+
 # Claude Code guards its own token refresh and config writes with npm
 # proper-lockfile: a `mkdir`-based advisory *directory* at "<target>.lock",
 # considered stale once its mtime is older than ~10s. A switch holds both locks
@@ -394,6 +399,65 @@ live_oauth_account() {
   printf '%s' "$oa"
 }
 
+# --- credential ownership ---------------------------------------------------
+#
+# The credential blob carries no identity, and the live Keychain item and the
+# config's oauthAccount have independent writers: a Claude Code session still
+# running as another account can write its own login back over a switched-in
+# one. So the config never proves whose token is live. Ownership is proven only
+# by the same refresh token (same grant) or by the OAuth profile endpoint.
+
+has_tokens() {
+  # Return 0 if claudeAiOauth JSON $1 carries a non-empty access and refresh token.
+  printf '%s' "$1" | jq -e '((.accessToken // "") != "") and ((.refreshToken // "") != "")' >/dev/null 2>&1
+}
+
+oauth_profile() {
+  # Print the OAuth profile response for access token $1 and return 0 on HTTP
+  # 200; return 1 on any failure. The token goes in a 0600 header file, never
+  # argv. Tests redefine this function.
+  local hdr body code
+  hdr=$(mktemp) || return 1
+  body=$(mktemp) || { rm -f "$hdr"; return 1; }
+  printf 'Authorization: Bearer %s\n' "$1" >"$hdr"
+  code=$(curl -s -m "$CCSWITCH_PROFILE_TIMEOUT" -o "$body" -w '%{http_code}' \
+    -H @"$hdr" -H 'anthropic-beta: oauth-2025-04-20' "$CCSWITCH_PROFILE_URL" 2>/dev/null)
+  rm -f "$hdr"
+  if [ "$code" = "200" ]; then
+    cat "$body"; rm -f "$body"; return 0
+  fi
+  rm -f "$body"
+  return 1
+}
+
+credential_owner() {
+  # Resolve claudeAiOauth JSON $1 to {"uuid","email","org"} on stdout, or
+  # return 1 when the owner cannot be established (offline, expired, no token).
+  local at resp
+  at=$(printf '%s' "$1" | jq -r '.accessToken // ""' 2>/dev/null)
+  [ -n "$at" ] || return 1
+  resp=$(oauth_profile "$at") || return 1
+  printf '%s' "$resp" | jq -ec '{uuid: (.account.uuid // ""), email: (.account.email // ""), org: (.organization.uuid // "")}
+    | select(.uuid != "")' 2>/dev/null
+}
+
+owner_matches() {
+  # Return 0 if resolved owner $2 is the account described by oauthAccount $1:
+  # same account uuid (email when $1 has none), and the same org whenever both
+  # sides name one.
+  printf '%s' "$1" | jq -e --argjson o "$2" '
+    (if (.accountUuid // "") != "" then .accountUuid == $o.uuid
+     else (.emailAddress // "") != "" and .emailAddress == $o.email end)
+    and ((.organizationUuid // "") == "" or $o.org == "" or .organizationUuid == $o.org)' >/dev/null 2>&1
+}
+
+owner_label() {
+  # A human name for resolved owner $1.
+  local e
+  e=$(printf '%s' "$1" | jq -r '.email // ""')
+  if [ -n "$e" ]; then printf '%s' "$e"; else printf 'a different account'; fi
+}
+
 lowest_free_slot() {
   local idx="$1" used n
   used=$(printf '%s' "$idx" | jq -r '.accounts[].slot' | sort -n)
@@ -541,6 +605,8 @@ cmd_add() {
   if [ -z "$claude_oauth" ]; then
     die "the active credential has no claudeAiOauth. Log in first, then: ccswitch add"
   fi
+  has_tokens "$claude_oauth" \
+    || die "the active credential has no tokens (Claude Code may be logged out). Log in again with /login, then: ccswitch add"
 
   # Live identity.
   local oauth_account
@@ -550,6 +616,16 @@ cmd_add() {
   org_uuid=$(printf '%s' "$oauth_account" | jq -r '.organizationUuid // ""')
   org_name=$(printf '%s' "$oauth_account" | jq -r '.organizationName // ""')
   [ -n "$email" ] || die "the active account has no email address; cannot save it"
+
+  # The config names the account; only the profile endpoint proves the token is
+  # that account's. A proven mismatch saves nothing.
+  local owner
+  if owner=$(credential_owner "$claude_oauth"); then
+    owner_matches "$oauth_account" "$owner" \
+      || die "the Keychain credential belongs to $(owner_label "$owner"), but the Claude config names $email. Quit every running Claude Code session, log in as $email, then: ccswitch add"
+  else
+    printf 'ccswitch: note: could not confirm with Anthropic whose credential this is; saving it as %s.\n' "$email" >&2
+  fi
 
   local index existing_slot existing_alias slot
   index=$(read_index)
@@ -702,7 +778,7 @@ _switch_rollback() {
 
 cmd_switch() {
   # ccswitch switch <N|email|alias>: make a saved account the live login,
-  # network-free, coordinating with Claude Code's own locks and rolling back
+  # with no network while the locks are held, coordinating with Claude Code's own locks and rolling back
   # on any failure.
   case "${1:-}" in
     -h | --help) cmd_help; return 0 ;;
@@ -743,6 +819,35 @@ cmd_switch() {
   local cred_account
   cred_account=$(active_account_name)
 
+  # Prove, before the locks (network is not allowed under them), that the live
+  # credential belongs to the outgoing slot. proven_claude is the exact
+  # claudeAiOauth proven to be that account's; it stays empty, with a reason,
+  # when ownership is disproved or unknown.
+  local proven_claude="" skip_reason="" stored_rt="" out_oa="" out_email=""
+  if [ -n "$active_slot" ]; then
+    local pre_live pre_claude owner
+    out_oa=$(printf '%s' "$index" | jq -c --argjson s "$active_slot" \
+      'first(.accounts[] | select(.slot==$s) | .oauthAccount) // {}')
+    out_email=$(printf '%s' "$out_oa" | jq -r '.emailAddress // ""')
+    stored_rt=$(kc_read "$CCSWITCH_SERVICE" "slot-$active_slot" 2>/dev/null \
+      | jq -r '.claudeAiOauth.refreshToken // ""' 2>/dev/null)
+    pre_live=$(kc_read "$CC_CRED_SERVICE" "$cred_account" 2>/dev/null)
+    pre_claude=$(printf '%s' "$pre_live" | jq -ec '.claudeAiOauth // empty' 2>/dev/null)
+    if ! has_tokens "$pre_claude"; then
+      skip_reason="the live credential has no tokens"
+    elif [ -n "$stored_rt" ] && [ "$(printf '%s' "$pre_claude" | jq -r '.refreshToken')" = "$stored_rt" ]; then
+      proven_claude="$pre_claude"
+    elif owner=$(credential_owner "$pre_claude"); then
+      if owner_matches "$out_oa" "$owner"; then
+        proven_claude="$pre_claude"
+      else
+        skip_reason="the live credential belongs to $(owner_label "$owner"). A Claude Code session still running as that account probably wrote its login back"
+      fi
+    else
+      skip_reason="Anthropic could not confirm whose the live credential is"
+    fi
+  fi
+
   local cfg shadow
   cfg=$(global_config_path)
   shadow=$(shadow_credentials_path)
@@ -776,18 +881,23 @@ cmd_switch() {
   if [ -f "$cfg" ]; then cfg_existed=1; cfg_snapshot=$(cat "$cfg"); else cfg_existed=0; cfg_snapshot=""; fi
   if [ -f "$shadow" ]; then shadow_existed=1; shadow_snapshot=$(cat "$shadow"); else shadow_existed=0; shadow_snapshot=""; fi
 
-  # Network-free re-capture of the outgoing account, before mutating the live
-  # stores: if the live identity maps to a saved slot, re-save the live
-  # claudeAiOauth there so a rotated refresh token is captured and the slot
-  # cannot go stale. Skipped when the live login matches no slot, so a foreign
-  # login can never poison a slot (the poison guard).
+  # Re-capture the outgoing account before mutating the live stores, so a
+  # rotated refresh token is saved and the slot cannot go stale. Only a
+  # credential proven to be that account's is written: the bytes proven before
+  # the locks, or the slot's own refresh token. Anything else (a foreign login,
+  # a session's write-back, an unverifiable token) leaves the slot as saved.
   if [ -n "$active_slot" ] && [ "$had_live" -eq 1 ]; then
     local out_claude out_value
-    out_claude=$(printf '%s' "$live_cred" | jq -ec '.claudeAiOauth // empty')
-    if [ -n "$out_claude" ]; then
+    out_claude=$(printf '%s' "$live_cred" | jq -ec '.claudeAiOauth // empty' 2>/dev/null)
+    if has_tokens "$out_claude" && { [ "$out_claude" = "$proven_claude" ] \
+      || { [ -n "$stored_rt" ] && [ "$(printf '%s' "$out_claude" | jq -r '.refreshToken')" = "$stored_rt" ]; }; }; then
       out_value=$(printf '%s' "$out_claude" | jq -c '{claudeAiOauth: .}')
       kc_write "$CCSWITCH_SERVICE" "slot-$active_slot" "$out_value" \
         || die "could not re-capture the outgoing account into slot $active_slot"
+    else
+      [ -n "$skip_reason" ] || skip_reason="the live credential changed during the switch"
+      printf 'ccswitch: slot %s (%s) was not re-saved: %s. It keeps its previously saved credential.\n' \
+        "$active_slot" "$out_email" "$skip_reason" >&2
     fi
   fi
 
@@ -816,7 +926,7 @@ cmd_switch() {
   trap - EXIT INT TERM
 
   printf 'Switched to slot %s  %s  (%s).\n' "$target_slot" "$target_email" "$(org_label "$target_org" "$target_orgn")"
-  printf 'A running Claude Code session picks this up within ~30s, or immediately on restart.\n'
+  printf 'Restart running Claude Code sessions: one left running can write its previous login back.\n'
 }
 
 cmd_remove() {

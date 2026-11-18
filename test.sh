@@ -52,10 +52,30 @@ kc_delete() {
   rm -f "$FAKE_KC/$(_fake_key "$1" "$2")"
 }
 
+# --- fake for the OAuth profile seam ----------------------------------------
+# Tokens resolve only once registered; an unregistered token behaves like the
+# endpoint being unreachable or answering 401.
+oauth_profile() {
+  local f="$FAKE_PROFILE/$(_fake_key profile "$1")"
+  [ -f "$f" ] || return 1
+  cat "$f"
+}
+register_profile() { # access_token account_uuid
+  local email
+  case "$2" in
+    uuid-A) email="stan@personal.com" ;;
+    uuid-B) email="stan@work.com" ;;
+    *) email="other@x.com" ;;
+  esac
+  printf '{"account":{"uuid":"%s","email":"%s"}}' "$2" "$email" \
+    >"$FAKE_PROFILE/$(_fake_key profile "$1")"
+}
+
 # --- fixtures ---------------------------------------------------------------
 fresh_env() {
   TEST_HOME=$(mktemp -d)
   FAKE_KC=$(mktemp -d)
+  FAKE_PROFILE=$(mktemp -d)
   export HOME="$TEST_HOME"
   unset CLAUDE_CONFIG_DIR
 }
@@ -96,7 +116,7 @@ test_add_then_list() {
 test_add_updates_in_place() {
   fresh_env; seed_active "$CRED_A"; seed_config "$OAUTH_ORG"
   run add
-  seed_active '{"claudeAiOauth":{"accessToken":"at-A2"},"mcpOAuth":{}}'
+  seed_active '{"claudeAiOauth":{"accessToken":"at-A2","refreshToken":"rt-A2"},"mcpOAuth":{}}'
   run add
   assert_rc 0 "$RC" "re-add succeeds"
   assert_eq 1 "$(index_json | jq '.accounts | length')" "no duplicate slot on re-add"
@@ -247,7 +267,7 @@ test_add_alias_flag() {
 
 test_add_alias_preserved_on_readd() {
   fresh_env; seed_active "$CRED_A"; seed_config "$OAUTH_ORG"; run add --alias work
-  seed_active '{"claudeAiOauth":{"accessToken":"at-A2"},"mcpOAuth":{}}'
+  seed_active '{"claudeAiOauth":{"accessToken":"at-A2","refreshToken":"rt-A2"},"mcpOAuth":{}}'
   run add
   assert_eq "work" "$(index_json | jq -r '.accounts[0].alias')" "re-add without --alias keeps the existing alias"
 }
@@ -354,9 +374,65 @@ test_switch_recaptures_outgoing() {
   fresh_env; seed_switch_slots
   # The live work credential rotated since it was saved.
   seed_active '{"claudeAiOauth":{"accessToken":"at-work2","refreshToken":"rt-work2"},"mcpOAuth":{"slack":{"accessToken":"mcp-A"}}}'
+  register_profile at-work2 uuid-B
   run switch 2
   assert_rc 0 "$RC" "switch succeeds"
   assert_contains "$(slot_value 1)" "at-work2" "outgoing slot re-captured with the freshest live token"
+}
+
+test_switch_recapture_refuses_reverted_live_token() {
+  fresh_env; seed_switch_slots
+  register_profile at-work uuid-B; register_profile at-pers uuid-A
+  run switch 2
+  # A Claude Code session still running as work writes its cached credential
+  # back over the switched-in one; the config still names personal.
+  seed_active "$CRED_WORK"
+  run switch 1
+  assert_rc 0 "$RC" "switch away from a reverted live token succeeds"
+  assert_contains "$(slot_value 2)" "at-pers" "poison guard: slot 2 keeps its own token, not work's"
+  assert_contains "$OUT" "not re-saved" "user is told the outgoing slot was not re-captured"
+  run switch 2
+  assert_contains "$(live_cred)" "at-pers" "switching back to slot 2 makes personal's token live"
+}
+
+test_switch_recapture_skipped_when_owner_unknown() {
+  fresh_env; seed_switch_slots
+  # Live work token rotated, and its owner cannot be resolved (offline, 401).
+  seed_active '{"claudeAiOauth":{"accessToken":"at-work2","refreshToken":"rt-work2"},"mcpOAuth":{}}'
+  run switch 2
+  assert_rc 0 "$RC" "switch succeeds when the outgoing owner is unresolvable"
+  assert_contains "$(slot_value 1)" "at-work" "slot 1 keeps its stored token"
+  assert_not_contains "$(slot_value 1)" "at-work2" "unverified token is not written into slot 1"
+  assert_contains "$OUT" "not re-saved" "user is told the outgoing slot was not re-captured"
+}
+
+test_switch_recapture_same_lineage_needs_no_network() {
+  fresh_env; seed_switch_slots
+  # Only the access token rotated; same refresh token proves the same grant.
+  seed_active '{"claudeAiOauth":{"accessToken":"at-work3","refreshToken":"rt-work"},"mcpOAuth":{}}'
+  run switch 2
+  assert_rc 0 "$RC" "switch succeeds"
+  assert_contains "$(slot_value 1)" "at-work3" "same-lineage token re-captured without the profile endpoint"
+}
+
+test_add_refuses_token_of_another_account() {
+  fresh_env
+  register_profile at-work uuid-B
+  # Config says personal, but the Keychain holds work's token.
+  seed_active "$CRED_WORK"; seed_config "$OAUTH_PERSONAL"
+  run add
+  assert_rc 1 "$RC" "add refuses a credential that belongs to another account"
+  assert_contains "$OUT" "stan@work.com" "error names the account the token belongs to"
+  if [ -f "$HOME/.ccswitch/accounts.json" ]; then fail "nothing saved on refusal"; else ok; fi
+}
+
+test_add_refuses_empty_tokens() {
+  fresh_env
+  seed_active '{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0},"mcpOAuth":{}}'
+  seed_config "$OAUTH_ORG"
+  run add
+  assert_rc 1 "$RC" "add refuses a credential with no tokens"
+  assert_contains "$OUT" "Log in" "error hints to log in again"
 }
 
 test_switch_recapture_skipped_when_no_match() {
@@ -559,6 +635,11 @@ for t in \
   test_switch_preserves_mcpOAuth \
   test_switch_preserves_config_keys \
   test_switch_recaptures_outgoing \
+  test_switch_recapture_refuses_reverted_live_token \
+  test_switch_recapture_skipped_when_owner_unknown \
+  test_switch_recapture_same_lineage_needs_no_network \
+  test_add_refuses_token_of_another_account \
+  test_add_refuses_empty_tokens \
   test_switch_recapture_skipped_when_no_match \
   test_switch_shadow_present_rewritten \
   test_switch_shadow_absent_not_created \

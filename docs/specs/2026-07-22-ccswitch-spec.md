@@ -149,22 +149,28 @@ candidates. The active account is derived at read time by matching the live
 to drift.
 
 **add.** Read the live `claudeAiOauth` from the Keychain (error, with a "log in
-first" hint, if absent) and the live `oauthAccount` from the global config (error
-if absent). If `(email, org)` already exists, overwrite that slot; else use the
-requested slot or the lowest free number. Write the slot's Keychain item, then
-update the index.
+first" hint, if absent, or if it lacks an access or refresh token) and the live
+`oauthAccount` from the global config (error if absent). If the OAuth profile
+endpoint resolves the credential to a different account than `oauthAccount`
+names, error and save nothing; if it cannot resolve it, save with a note. If
+`(email, org)` already exists, overwrite that slot; else use the requested slot
+or the lowest free number. Write the slot's Keychain item, then update the
+index.
 
 **switch.** Determine the target (a switch to the already-active account is a
-reported no-op). Before mutating, perform a **local, network-free re-capture of
-the outgoing account**: find the slot whose stored `(email, org)` equals the live
-`oauthAccount`; if found, re-write the live `claudeAiOauth` into that slot so a
-rotated refresh token is captured and the slot cannot go stale; if not found, skip
-re-capture so a foreign login can never poison a slot. This is the reference's
-outgoing-credential protection with its profile-endpoint network oracle replaced
-by the locally-available `oauthAccount` identity — chosen deliberately for
-simplicity and confirmed safe under multi-device login, since each device holds an
-independent refresh-token lineage while the `(email, org)` identity is identical
-everywhere.
+reported no-op). Before mutating, **re-capture the outgoing account** (the slot
+whose stored `(email, org)` equals the live `oauthAccount`) so a rotated refresh
+token is saved and the slot cannot go stale. The live `oauthAccount` names the
+outgoing slot but never proves whose token is live: the Keychain item and the
+config have independent writers, and a Claude Code session still running as
+another account can write its own login back over a switched-in one. So the live
+`claudeAiOauth` is written into the slot only when it is proven to be that
+account's: it carries the slot's stored refresh token, or the OAuth profile
+endpoint (`GET /api/oauth/profile`, queried before the locks are taken) resolves
+it to the slot's account uuid and org. Otherwise (no live slot match, a token
+that resolves to another account, an unresolvable token, a token without access
+and refresh tokens, or live bytes that changed after the proof) the slot keeps
+its saved credential and the switch reports that it was not re-saved.
 
 Then, holding **both of Claude Code's own advisory locks** (the refresh lock and
 the config lock, which are `mkdir`-based advisory directory locks; acquire by
@@ -177,8 +183,9 @@ preserving mode; (3) the shadow credentials file **only if it already exists**,
 rewritten via temp-file, chmod 0600, and rename to bump its mtime for hot-reload —
 never created when absent. Any failure restores all touched stores from the
 snapshot and exits non-zero. No network calls are made while holding the locks.
-On success, print the new active account and note the ~30-second hot-reload / or
-restart behavior.
+On success, print the new active account and tell the user to restart running
+Claude Code sessions, since a session left running can write its previous login
+back.
 
 **JSON manipulation** is done with `jq` (built into macOS 15+), using targeted
 key assignment so only the intended key changes and all sibling keys survive
